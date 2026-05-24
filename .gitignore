@@ -1,0 +1,9 @@
+dataset/
+output/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.tar.gz
+*.tsv
+*.gz
+*.gmt
