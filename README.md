@@ -145,6 +145,8 @@ Scores used:
 
 Results: 6 Tier A findings, 9 Tier B supported hypotheses, 3 Tier C exploratory.
 
+Validated on GBM (488 patients, ARI 0.851): 8 Tier A findings with significant survival separation (archetype 0 p=0.034, archetype 2 p=0.008).
+
 Datasets required:
 
 | Dataset | Source |
@@ -155,6 +157,21 @@ Datasets required:
 | METABRIC clinical | https://www.cbioportal.org/study/summary?id=brca_metabric |
 | Lehmann subtypes | https://www.cbioportal.org/study/summary?id=brca_tcga |
 | MSigDB Hallmark | https://www.gsea-msigdb.org/gsea/msigdb |
+
+## Benchmarking
+
+bioconverge was compared against five clustering methods on the TNBC cohort:
+
+| Method | ARI | Silhouette |
+|---|---|---|
+| bioconverge (Layer 1) | 0.398 | 0.197 |
+| PCA + KMeans | 0.401 | 0.203 |
+| NMF + KMeans | 0.491 | 0.140 |
+| Hierarchical Ward | 0.210 | 0.286 |
+| Gaussian Mixture | 0.223 | 0.159 |
+| MOFA+ | 0.789 | 0.128 |
+
+bioconverge is the only method that combines clustering with concordance analysis, database-driven hypothesis generation, and tiered validation.
 
 ## Parameters
 
@@ -179,6 +196,20 @@ numpy, pandas, scipy, scikit-learn, matplotlib, seaborn,
 lifelines, umap-learn, hdbscan, requests, plotly, torch,
 tensorflow, jupyter
 ```
+
+## Version history
+
+### 0.1.2
+- Fixed convergence index clipping bug (values now bounded to [-1, 1])
+- Added benchmarking against MOFA+, PCA, NMF, Hierarchical, GMM
+- Added GBM validation cohort (488 patients, ARI 0.851)
+- Added sensitivity analysis for all key parameters
+
+### 0.1.1
+- Added long description for PyPI
+
+### 0.1.0
+- Initial release
 
 ## License
 
