@@ -83,8 +83,9 @@ class ConcordanceAnalyzer:
             z = (vals[valid] - global_means[valid]) / global_stds[valid]
             mean_z = np.mean(z)
             std_z = np.std(z)
-            conv = 1.0 - std_z / (abs(mean_z) + 1e-8)
-            patient_conv.append(float(conv))
+            conv = float(np.clip(1.0 - std_z / (abs(mean_z) + 1e-8), -1.0, 1.0))
+            patient_conv.append(conv)
+
         conv_series = pd.Series(patient_conv)
         t33 = conv_series.quantile(0.33)
         t67 = conv_series.quantile(0.67)

@@ -1,3 +1,25 @@
+Metadata-Version: 2.4
+Name: bioconverge
+Version: 0.1.2
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: scipy
+Requires-Dist: scikit-learn
+Requires-Dist: matplotlib
+Requires-Dist: seaborn
+Requires-Dist: lifelines
+Requires-Dist: umap-learn
+Requires-Dist: hdbscan
+Requires-Dist: requests
+Requires-Dist: plotly
+Requires-Dist: nbformat
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: requires-dist
+Dynamic: requires-python
+
 # bioconverge
 
 Multi-layer biological score integration and hypothesis validation tool for cancer research.
