@@ -28,10 +28,10 @@ def _retry_get(url, params=None, timeout=30, retries=3):
             time.sleep(2 ** attempt)
 
 
-def load_clinical_tcga(path):
+def load_survival(path, time_col=None, event_col=None, patient_col=None):
     if not os.path.exists(path):
         raise FileNotFoundError(f"not found: {path}")
-    print("loading clinical")
+    print("loading survival")
     if path.endswith(".tar.gz") or path.endswith(".tar"):
         with tarfile.open(path) as t:
             names = t.getnames()
@@ -39,28 +39,49 @@ def load_clinical_tcga(path):
             if match is None:
                 raise ValueError("clinical.tsv not in tar")
             df = pd.read_csv(t.extractfile(match), sep="\t", low_memory=False)
-    else:
+    elif path.endswith(".tsv") or path.endswith(".txt"):
         df = pd.read_csv(path, sep="\t", low_memory=False)
-    pid_col = next((c for c in ["cases.submitter_id", "Patient ID", "patient_id"] if c in df.columns), df.columns[0])
-    df = df.drop_duplicates(subset=pid_col)
-    df["patient_id"] = df[pid_col].astype(str).str[:12]
-    vital_col = next((c for c in df.columns if "vital" in c.lower()), None)
-    death_col = next((c for c in df.columns if "days_to_death" in c.lower()), None)
-    fu_col = next((c for c in df.columns if "last_follow" in c.lower()), None)
-    os_months_col = next((c for c in df.columns if "os_months" in c.lower()), None)
-    os_status_col = next((c for c in df.columns if "os_status" in c.lower()), None)
-    if vital_col and death_col and fu_col:
-        dead_mask = df[vital_col].astype(str).str.lower().str.strip() == "dead"
-        df["OS_event"] = dead_mask.astype(int)
-        days_death = pd.to_numeric(df[death_col], errors="coerce")
-        days_fu = pd.to_numeric(df[fu_col], errors="coerce")
-        df["OS_days"] = np.where(dead_mask, days_death, days_fu)
-    elif os_months_col and os_status_col:
-        df["OS_event"] = df[os_status_col].astype(str).str.contains("1|deceased|dead", case=False).astype(int)
-        df["OS_days"] = pd.to_numeric(df[os_months_col], errors="coerce") * 30.44
     else:
-        raise ValueError("no survival columns found")
+        df = pd.read_csv(path, low_memory=False)
+    if patient_col and patient_col in df.columns:
+        df["patient_id"] = df[patient_col].astype(str).str[:12]
+    else:
+        pid_col = next((c for c in ["patient_id", "Patient ID", "cases.submitter_id",
+                                     "PATIENT_ID", "PatientID"] if c in df.columns), df.columns[0])
+        df["patient_id"] = df[pid_col].astype(str).str[:12]
+    if time_col and time_col in df.columns:
+        df["OS_days"] = pd.to_numeric(df[time_col], errors="coerce")
+    else:
+        time_candidates = [c for c in df.columns if any(x in c.lower() for x in
+                          ["days_to_death", "os_days", "survival_time", "overall_survival",
+                           "os_months", "days_to_last_follow"])]
+        if not time_candidates:
+            raise ValueError(f"no time column found. available: {list(df.columns)}")
+        best_time = time_candidates[0]
+        df["OS_days"] = pd.to_numeric(df[best_time], errors="coerce")
+        if "month" in best_time.lower():
+            df["OS_days"] = df["OS_days"] * 30.44
+        print(f"using time column: {best_time}")
+    if event_col and event_col in df.columns:
+        df["OS_event"] = pd.to_numeric(df[event_col], errors="coerce").fillna(0).astype(int)
+    else:
+        event_candidates = [c for c in df.columns if any(x in c.lower() for x in
+                           ["os_status", "vital_status", "os_event", "event",
+                            "overall_survival_status", "deceased"])]
+        if not event_candidates:
+            raise ValueError(f"no event column found. available: {list(df.columns)}")
+        best_event = event_candidates[0]
+        col_vals = df[best_event].astype(str).str.lower().str.strip()
+        if col_vals.str.match(r"^[01]$").all():
+            df["OS_event"] = pd.to_numeric(df[best_event], errors="coerce").fillna(0).astype(int)
+        else:
+            df["OS_event"] = col_vals.str.contains("dead|deceased|1|yes", case=False).astype(int)
+        print(f"using event column: {best_event}")
     return df[["patient_id", "OS_days", "OS_event"]].dropna(subset=["OS_days"]).reset_index(drop=True)
+
+
+def load_clinical_tcga(path, time_col=None, event_col=None, patient_col=None):
+    return load_survival(path, time_col=time_col, event_col=event_col, patient_col=patient_col)
 
 
 def load_biospecimen(path):

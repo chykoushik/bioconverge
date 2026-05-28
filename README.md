@@ -87,6 +87,19 @@ result = bc.integrate(
 result.survival_analysis()
 ```
 
+bioconverge auto-detects column names from any CSV. If your survival file uses different column names just specify them:
+
+```python
+result = bc.integrate(
+    scores="my_scores.csv",
+    patient_col="patient_id",
+    score_metadata={...},
+    outcome="survival.csv",
+    time_col="survival_months",
+    event_col="vital_status"
+)
+```
+
 ## What you get back
 
 ```python
@@ -198,6 +211,15 @@ tensorflow, jupyter
 ```
 
 ## Version history
+
+### 0.1.4
+- Auto survival column detection supporting any CSV format
+- Users can now pass any survival file with any column names via time_col and event_col
+- Fixed ValidationEngine to pass time_col and event_col through all layers
+
+### 0.1.3
+- Installed as editable package for local development
+- Minor internal fixes
 
 ### 0.1.2
 - Fixed convergence index clipping bug (values now bounded to [-1, 1])

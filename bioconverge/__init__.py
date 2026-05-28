@@ -107,12 +107,17 @@ def integrate(
                     metabric_path = fpath
                 elif "brca_tcga" in fname and fname.endswith(".tsv"):
                     tcga_brca_path = fpath
+        if outcome is not None:
+            clinical_tar = outcome
         l4 = ValidationEngine(
             clinical_tar_path=clinical_tar,
             mut_tar_path=mut_tar,
             metabric_path=metabric_path,
             tcga_brca_path=tcga_brca_path,
             dataset_dir=dataset_dir,
+            time_col=time_col,
+            event_col=event_col,
+            patient_col=patient_col,
         )
         km_dir = os.path.join(output_dir, "kaplan_meier")
         l4.validate(

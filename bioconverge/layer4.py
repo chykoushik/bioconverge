@@ -9,7 +9,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from .utils import api_get, load_clinical_tcga, load_maf_tp53, load_metabric, load_tcga_brca
+from .utils import api_get, load_survival, load_maf_tp53, load_metabric, load_tcga_brca
 from .layer1 import ConcordanceAnalyzer
 from .layer3 import HypothesisGenerator, _count_pubmed, _pubmed_flag
 
@@ -68,12 +68,18 @@ class ValidationEngine:
         metabric_path=None,
         tcga_brca_path=None,
         dataset_dir=None,
+        time_col=None,
+        event_col=None,
+        patient_col=None,
     ):
         self.clinical_tar_path = clinical_tar_path
         self.mut_tar_path = mut_tar_path
         self.metabric_path = metabric_path
         self.tcga_brca_path = tcga_brca_path
         self.dataset_dir = dataset_dir
+        self.time_col = time_col
+        self.event_col = event_col
+        self.patient_col = patient_col
         self._survival_results = None
         self._metabric_results = None
         self._benchmark_results = None
@@ -97,7 +103,12 @@ class ValidationEngine:
             return
         print("survival analysis")
         try:
-            clinical = load_clinical_tcga(self.clinical_tar_path)
+            clinical = load_survival(
+                self.clinical_tar_path,
+                time_col=self.time_col,
+                event_col=self.event_col,
+                patient_col=self.patient_col,
+            )
         except Exception as e:
             self._survival_results = {"skipped": True, "reason": str(e)}
             return
@@ -168,7 +179,6 @@ class ValidationEngine:
             return
         er_col = "ER status measured by IHC"
         her2_col = "HER2 Status"
-        pr_col = next((c for c in metabric.columns if "pr" in c.lower() and "status" in c.lower()), None)
         tnbc_mask = pd.Series([True] * len(metabric))
         if er_col in metabric.columns:
             tnbc_mask &= metabric[er_col].str.lower().str.strip() == "negative"
@@ -283,13 +293,13 @@ class ValidationEngine:
             else:
                 precision = 0.0
                 recall = 0.0
+                recovered = []
             lehmann_results[subtype] = {
                 "precision": precision,
                 "recall": recall,
                 "keywords": keywords,
-                "recovered_processes": list(set(recovered)) if fake_hyp is not None and not fake_hyp.empty else [],
+                "recovered_processes": list(set(recovered)),
             }
-        # per-process: collect processes that matched any Lehmann keyword
         process_bench_pass = set()
         for subtype, vals in lehmann_results.items():
             if vals["precision"] > 0.15 and vals["recall"] > 0.15:
@@ -334,31 +344,22 @@ class ValidationEngine:
         if hypotheses_df is None or hypotheses_df.empty:
             self._tiered_hypotheses = hypotheses_df
             return
-
-        # source 1: archetypes with survival signal
         surv_archs = set()
         if self._survival_results and not self._survival_results.get("skipped"):
             surv_df = self._survival_results.get("results", pd.DataFrame())
             if not surv_df.empty and "survival_signal" in surv_df.columns:
                 surv_archs = set(surv_df[surv_df["survival_signal"]]["archetype"].tolist())
-
-        # source 2: processes replicated in METABRIC
         replicated_processes = set()
         if self._metabric_results and not self._metabric_results.get("skipped"):
             replicated_processes = self._metabric_results.get("replicated_processes", set())
-
-        # source 3: processes that passed Lehmann benchmark
         process_bench_pass = set()
         if self._benchmark_results and not self._benchmark_results.get("skipped"):
             process_bench_pass = self._benchmark_results.get("process_bench_pass", set())
-
-        # source 4: processes with strong literature support
         lit_processes = set()
         if self._literature_results and not self._literature_results.get("skipped"):
             lit_df = self._literature_results.get("results", pd.DataFrame())
             if not lit_df.empty:
                 lit_processes = set(lit_df[lit_df["literature_support"]]["process"].tolist())
-
         tiered = hypotheses_df.copy()
         tiers = []
         val_scores = []
@@ -367,23 +368,14 @@ class ValidationEngine:
             process = str(row.get("process", ""))
             process_lower = process.lower()
             score = 0
-
-            # source 1: this archetype has a survival signal
             if arch in surv_archs:
                 score += 1
-
-            # source 2: this process was replicated in METABRIC
             if process in replicated_processes:
                 score += 1
-
-            # source 3: this process matches a Lehmann keyword that passed benchmark
             if any(kw in process_lower for kw in process_bench_pass):
                 score += 1
-
-            # source 4: strong literature support for this process
             if process in lit_processes:
                 score += 1
-
             val_scores.append(score)
             if score >= 3:
                 tiers.append("A")
@@ -391,7 +383,6 @@ class ValidationEngine:
                 tiers.append("B")
             else:
                 tiers.append("C")
-
         tiered["confidence_tier"] = tiers
         tiered["validation_score"] = val_scores
         self._tiered_hypotheses = tiered.sort_values(
