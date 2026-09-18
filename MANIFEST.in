@@ -1,0 +1,6 @@
+global-exclude *
+include pyproject.toml setup.py MANIFEST.in README.md CHANGES.md LICENSE
+include constraints-py310-windows.txt
+include bioconverge/*.py
+include tests/*.py
+include notebooks/01_TNBC_demo.ipynb

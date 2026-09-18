@@ -1,27 +1,13 @@
-from setuptools import setup, find_packages
+from pathlib import Path
 
-with open("README.md", "r", encoding="utf-8") as f:
-    long_description = f.read()
+from setuptools import setup
+from setuptools.command.sdist import sdist
 
-setup(
-    name="bioconverge",
-    version="0.1.4",
-    packages=find_packages(),
-    long_description=long_description,
-    long_description_content_type="text/markdown",
-    install_requires=[
-        "numpy",
-        "pandas",
-        "scipy",
-        "scikit-learn",
-        "matplotlib",
-        "seaborn",
-        "lifelines",
-        "umap-learn",
-        "hdbscan",
-        "requests",
-        "plotly",
-        "nbformat",
-    ],
-    python_requires=">=3.8",
-)
+
+class SourceDistribution(sdist):
+    def make_release_tree(self, base_dir, files):
+        files = [name for name in files if not any(part.endswith(".egg-info") for part in Path(name).parts)]
+        super().make_release_tree(base_dir, files)
+
+
+setup(cmdclass={"sdist": SourceDistribution})

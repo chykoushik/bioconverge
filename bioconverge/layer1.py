@@ -5,9 +5,14 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import adjusted_rand_score
 from sklearn.preprocessing import StandardScaler
 
+from .validation import check_scores, validate_seed, InputValidationError, status
+
 
 class ConcordanceAnalyzer:
     def __init__(self, df, patient_col):
+        df, constants = check_scores(df, patient_col)
+        self.statuses = {}
+        self.diagnostics = {"constant_columns": constants, "missing_scores": df.drop(columns=patient_col).isna().sum().to_dict()}
         self.patient_col = patient_col
         self.patients = df[patient_col].values
         self.score_cols = [c for c in df.columns if c != patient_col]
@@ -20,12 +25,18 @@ class ConcordanceAnalyzer:
         self._scaler = None
 
     def fit(self, n_archetypes=3, n_bootstrap=1000, random_state=42):
-        print("fitting concordance")
+        validate_seed(random_state)
+        if isinstance(n_bootstrap, bool) or not isinstance(n_bootstrap, (int, np.integer)) or n_bootstrap < 1:
+            raise InputValidationError("n_bootstrap must be a positive integer")
+        frame = pd.DataFrame(self.X, columns=self.score_cols)
+        frame.insert(0, self.patient_col, self.patients)
+        check_scores(frame, self.patient_col, n_archetypes)
+        self.random_state = int(random_state)
         self._compute_concordance(n_bootstrap, random_state)
         self._compute_convergence()
         self._compute_archetypes(n_archetypes, random_state)
         self._compute_stability(n_archetypes, n_bootstrap, random_state)
-        print("layer1 done")
+        self.statuses["archetypes"] = status("completed")
         return self
 
     def _compute_concordance(self, n_bootstrap, random_state):
@@ -36,7 +47,7 @@ class ConcordanceAnalyzer:
             for j in range(i + 1, n):
                 x = self.X[:, i]
                 y = self.X[:, j]
-                mask = ~(np.isnan(x) | np.isnan(y))
+                mask = np.isfinite(x) & np.isfinite(y)
                 if mask.sum() < 5:
                     rows.append({
                         "score_a": self.score_cols[i],
@@ -45,29 +56,40 @@ class ConcordanceAnalyzer:
                         "ci_lo": np.nan,
                         "ci_hi": np.nan,
                         "n_patients": int(mask.sum()),
+                        "n_bootstrap_valid": 0,
+                        "reason": "fewer than five paired observations",
                     })
+                    continue
+                if np.ptp(x[mask]) == 0 or np.ptp(y[mask]) == 0:
+                    rows.append({"score_a": self.score_cols[i], "score_b": self.score_cols[j],
+                                 "spearman_rho": np.nan, "ci_lo": np.nan, "ci_hi": np.nan,
+                                 "n_patients": int(mask.sum()), "n_bootstrap_valid": 0,
+                                 "reason": "constant score"})
                     continue
                 rho, _ = spearmanr(x[mask], y[mask])
                 xm, ym = x[mask], y[mask]
                 boot = []
                 for _ in range(n_bootstrap):
                     idx = rng.integers(0, len(xm), size=len(xm))
-                    try:
-                        rb, _ = spearmanr(xm[idx], ym[idx])
+                    if np.ptp(xm[idx]) == 0 or np.ptp(ym[idx]) == 0:
+                        continue
+                    rb, _ = spearmanr(xm[idx], ym[idx])
+                    if np.isfinite(rb):
                         boot.append(rb)
-                    except Exception:
-                        pass
                 ci_lo = float(np.percentile(boot, 2.5)) if boot else np.nan
                 ci_hi = float(np.percentile(boot, 97.5)) if boot else np.nan
                 rows.append({
                     "score_a": self.score_cols[i],
                     "score_b": self.score_cols[j],
+                    "n_bootstrap_valid": len(boot),
+                    "reason": None if boot else "no valid bootstrap correlations",
                     "spearman_rho": float(rho),
                     "ci_lo": ci_lo,
                     "ci_hi": ci_hi,
                     "n_patients": int(mask.sum()),
                 })
-        self._concordance_df = pd.DataFrame(rows)
+        self._concordance_df = pd.DataFrame(rows, columns=["score_a", "score_b", "spearman_rho", "ci_lo", "ci_hi", "n_patients", "n_bootstrap_valid", "reason"])
+        self.statuses["concordance"] = status("completed" if rows else "unavailable", None if rows else "at least two scores required")
 
     def _compute_convergence(self):
         global_means = np.nanmean(self.X, axis=0)
@@ -91,7 +113,7 @@ class ConcordanceAnalyzer:
         t67 = conv_series.quantile(0.67)
 
         def _stratum(v):
-            if pd.isna(v):
+            if pd.isna(v) or t33 == t67:
                 return "unknown"
             if v >= t67:
                 return "convergent_high"
@@ -99,6 +121,8 @@ class ConcordanceAnalyzer:
                 return "convergent_mid"
             return "convergent_low"
 
+        self.statuses["convergence_strata"] = status("unavailable" if pd.isna(t33) or t33 == t67 else "completed",
+                                                     "insufficient variation in convergence thresholds" if pd.isna(t33) or t33 == t67 else None)
         self._convergence_df = pd.DataFrame({
             "patient_id": self.patients,
             "convergence_index": patient_conv,
@@ -134,21 +158,31 @@ class ConcordanceAnalyzer:
         base_labels = self._archetypes_df["archetype"].values
         n_iters = min(n_bootstrap, 200)
         aris = []
+        failures = []
         for _ in range(n_iters):
             idx = rng.integers(0, len(X_scaled), size=len(X_scaled))
+            if len(np.unique(X_scaled[idx], axis=0)) < n_archetypes:
+                failures.append("insufficient distinct bootstrap profiles")
+                continue
             try:
-                km2 = KMeans(n_clusters=n_archetypes, random_state=None, n_init=3, max_iter=100)
+                km2 = KMeans(n_clusters=n_archetypes, random_state=int(rng.integers(0, 2 ** 32 - 1)), n_init=3, max_iter=100)
                 km2.fit(X_scaled[idx])
                 pred = km2.predict(X_scaled)
                 aris.append(adjusted_rand_score(base_labels, pred))
-            except Exception:
-                pass
+            except (ValueError, FloatingPointError) as e:
+                failures.append(str(e))
         self._stability_dict = {
+            "requested_bootstrap": int(n_bootstrap),
+            "attempted_bootstrap": n_iters,
+            "failed_bootstrap": len(failures),
+            "failure_reasons": failures,
             "mean_ari": float(np.mean(aris)) if aris else np.nan,
             "std_ari": float(np.std(aris)) if aris else np.nan,
             "n_bootstrap": len(aris),
-            "interpretation": "stable" if (aris and np.mean(aris) > 0.6) else "unstable",
+            "interpretation": "stable" if (aris and np.mean(aris) > 0.6) else "unstable" if aris else "unavailable",
         }
+
+        self.statuses["stability"] = status("completed" if aris else "unavailable", None if aris else "no valid bootstrap fits")
 
     def concordance(self):
         return self._concordance_df
@@ -159,7 +193,7 @@ class ConcordanceAnalyzer:
     def discordance(self):
         if self._archetypes_df is None or self._convergence_df is None:
             return None
-        merged = self._archetypes_df.merge(self._convergence_df, on="patient_id")
+        merged = self._archetypes_df.merge(self._convergence_df, on="patient_id", validate="one_to_one")
         return merged[merged["stratum"] == "convergent_low"].copy().reset_index(drop=True)
 
     def archetypes(self):

@@ -8,6 +8,7 @@ from sklearn.linear_model import LogisticRegression
 from bioconverge.layer2 import FragilityAnalyzer
 
 
+
 def _make_model_and_data(n=40, d=10, seed=0):
     rng = np.random.default_rng(seed)
     X = rng.standard_normal((n, d))

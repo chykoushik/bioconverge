@@ -1,7 +1,4 @@
-import difflib
 import os
-import time
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -9,69 +6,54 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from .utils import api_get, load_survival, load_maf_tp53, load_metabric, load_tcga_brca
-from .layer1 import ConcordanceAnalyzer
-from .layer3 import HypothesisGenerator, _count_pubmed, _pubmed_flag
-
-PUBMED_SEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+from .utils import load_survival, load_maf_tp53, load_metabric, load_tcga_brca
+from .validation import InputValidationError, validate_ids, validate_seed, status
 
 LEHMANN_SIGNATURES = {
     "BL1": ["DNA damage response", "BRCA", "cell cycle", "checkpoint"],
     "BL2": ["growth factor signaling", "IGF1R", "EGFR", "PI3K"],
-    "M":   ["epithelial-mesenchymal transition", "EMT", "TGF", "WNT"],
-    "IM":  ["immune activation", "interferon", "cytokine", "T cell"],
+    "M": ["epithelial-mesenchymal transition", "EMT", "TGF", "WNT"],
+    "IM": ["immune activation", "interferon", "cytokine", "T cell"],
 }
 
 
+def _result(state, reason=None, **details):
+    return {**status(state, reason), "skipped": state != "completed", **details}
+
+
+def _adjust_pvalues(values):
+    values = np.asarray(values, dtype=float)
+    adjusted = np.full(len(values), np.nan)
+    indices = np.flatnonzero(np.isfinite(values))
+    order = indices[np.argsort(values[indices])]
+    if len(order):
+        ranked = values[order] * len(order) / np.arange(1, len(order) + 1)
+        adjusted[order] = np.minimum(1, np.minimum.accumulate(ranked[::-1])[::-1])
+    return adjusted
+
+
 def _km_plot(durations, events, groups, group_labels, title, save_path):
-    try:
-        from lifelines import KaplanMeierFitter
-        from lifelines.statistics import logrank_test
-    except ImportError:
-        return None, None, None
+    from lifelines import KaplanMeierFitter
     fig, ax = plt.subplots(figsize=(8, 5))
-    unique_groups = sorted(set(groups))
-    pvals = []
-    hrs = []
-    for g in unique_groups:
-        mask = np.array(groups) == g
-        kmf = KaplanMeierFitter()
-        kmf.fit(np.array(durations)[mask], np.array(events)[mask], label=group_labels.get(g, str(g)))
-        kmf.plot_survival_function(ax=ax)
-        hrs.append(float(np.array(events)[mask].sum() / max(mask.sum(), 1)))
-    if len(unique_groups) == 2:
-        mask0 = np.array(groups) == unique_groups[0]
-        mask1 = np.array(groups) == unique_groups[1]
-        try:
-            res = logrank_test(
-                np.array(durations)[mask0], np.array(durations)[mask1],
-                np.array(events)[mask0], np.array(events)[mask1],
-            )
-            pvals.append(float(res.p_value))
-            ax.set_title(f"{title} (p={res.p_value:.3f})")
-        except Exception:
-            ax.set_title(title)
-    else:
-        ax.set_title(title)
-    ax.set_xlabel("days")
-    ax.set_ylabel("survival")
-    fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return fig, pvals, hrs
+    try:
+        for group in sorted(set(groups)):
+            mask = np.asarray(groups) == group
+            fitter = KaplanMeierFitter()
+            fitter.fit(np.asarray(durations)[mask], np.asarray(events)[mask], label=group_labels.get(group, str(group)))
+            fitter.plot_survival_function(ax=ax)
+        ax.set(xlabel="days", ylabel="survival", title=title)
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    finally:
+        plt.close(fig)
 
 
 class ValidationEngine:
-    def __init__(
-        self,
-        clinical_tar_path=None,
-        mut_tar_path=None,
-        metabric_path=None,
-        tcga_brca_path=None,
-        dataset_dir=None,
-        time_col=None,
-        event_col=None,
-        patient_col=None,
-    ):
+    def __init__(self, clinical_tar_path=None, mut_tar_path=None, metabric_path=None,
+                 tcga_brca_path=None, dataset_dir=None, time_col=None, event_col=None,
+                 patient_col=None, random_state=42, time_unit=None, event_mapping=None,
+                 disease_context=None):
+        validate_seed(random_state)
+        self.random_state = int(random_state)
         self.clinical_tar_path = clinical_tar_path
         self.mut_tar_path = mut_tar_path
         self.metabric_path = metabric_path
@@ -80,314 +62,169 @@ class ValidationEngine:
         self.time_col = time_col
         self.event_col = event_col
         self.patient_col = patient_col
+        self.time_unit = time_unit
+        self.event_mapping = event_mapping
+        self.disease_context = disease_context
         self._survival_results = None
         self._metabric_results = None
         self._benchmark_results = None
         self._literature_results = None
         self._tiered_hypotheses = None
+        self.statuses = {}
 
     def validate(self, hypotheses_df, archetypes_df, score_df, patient_col, score_metadata, km_output_dir=None):
-        print("validation start")
-        self._run_survival(archetypes_df, km_output_dir=km_output_dir)
+        if not isinstance(archetypes_df, pd.DataFrame) or not {"patient_id", "archetype"}.issubset(archetypes_df):
+            raise InputValidationError("archetypes require patient_id and archetype")
+        validate_ids(archetypes_df.patient_id)
+        if archetypes_df.archetype.isna().any():
+            raise InputValidationError("archetype labels must be nonmissing")
+        if not isinstance(score_df, pd.DataFrame) or patient_col not in score_df:
+            raise InputValidationError("score patient column is missing")
+        validate_ids(score_df[patient_col])
+        if set(score_df[patient_col]) != set(archetypes_df.patient_id):
+            raise InputValidationError("score and archetype patient IDs must match")
+        if hypotheses_df is not None and not hypotheses_df.empty and not {"archetype", "process", "db_support"}.issubset(hypotheses_df):
+            raise InputValidationError("invalid hypothesis schema")
+        self._run_survival(archetypes_df, km_output_dir)
         self._run_metabric(score_metadata)
-        self.compute_replication_rate(hypotheses_df)
         self._run_benchmark(score_df, patient_col, score_metadata, archetypes_df)
         self._run_literature(hypotheses_df, score_metadata)
         self._assign_tiers(hypotheses_df)
-        print("validation done")
+        for name, result in [("survival", self._survival_results), ("metabric", self._metabric_results),
+                             ("benchmark", self._benchmark_results), ("literature", self._literature_results)]:
+            self.statuses[name] = status(result["state"], result["reason"])
+        self.statuses["empirical_validation"] = status("unavailable", "metadata annotations are not empirically tested hypotheses")
         return self
 
     def _run_survival(self, archetypes_df, km_output_dir=None):
-        if self.clinical_tar_path is None or not os.path.exists(self.clinical_tar_path):
-            self._survival_results = {"skipped": True, "reason": "no clinical data"}
+        if self.clinical_tar_path is None:
+            self._survival_results = _result("skipped", "no clinical data")
             return
-        print("survival analysis")
         try:
-            clinical = load_survival(
-                self.clinical_tar_path,
-                time_col=self.time_col,
-                event_col=self.event_col,
-                patient_col=self.patient_col,
-            )
+            clinical = load_survival(self.clinical_tar_path, self.time_col, self.event_col, self.patient_col,
+                                     time_unit=self.time_unit, event_mapping=self.event_mapping)
+            merged = archetypes_df.merge(clinical, on="patient_id", how="inner", validate="one_to_one")
+            diagnostics = {**clinical.attrs, "n_matched": len(merged),
+                           "n_unmatched": len(archetypes_df) - len(merged)}
+            if len(merged) < 6 or not merged.OS_event.any():
+                self._survival_results = _result("unavailable", "insufficient matched patients or no observed events", **diagnostics)
+                return
+            from lifelines.statistics import logrank_test
+            mutants = set()
+            assessed = set()
+            mutation_status = status("skipped", "no mutation data")
+            if self.mut_tar_path is not None:
+                try:
+                    mutations = load_maf_tp53(self.mut_tar_path)
+                    mutants = set(mutations.patient_id)
+                    assessed = set(mutations.attrs.get("assessed_patients", []))
+                    mutation_status = status("completed")
+                except Exception as e:
+                    mutation_status = status("failed", f"{type(e).__name__}: {e}")
+            rows = []
+            for arch in sorted(merged.archetype.unique()):
+                selected = merged.archetype == arch
+                if selected.sum() < 3 or (~selected).sum() < 3:
+                    rows.append({"archetype": arch, "state": "unavailable", "reason": "fewer than three patients in a comparison group",
+                                 "logrank_pvalue": np.nan, "n_archetype": int(selected.sum()), "n_rest": int((~selected).sum())})
+                    continue
+                test = logrank_test(merged.loc[selected, "OS_days"], merged.loc[~selected, "OS_days"],
+                                    merged.loc[selected, "OS_event"], merged.loc[~selected, "OS_event"])
+                pvalue = float(test.p_value)
+                if not np.isfinite(pvalue):
+                    rows.append({"archetype": arch, "state": "unavailable", "reason": "log-rank test is undefined",
+                                 "logrank_pvalue": np.nan, "n_archetype": int(selected.sum()), "n_rest": int((~selected).sum())})
+                    continue
+                row = {"archetype": arch, "state": "completed", "reason": None,
+                       "n_archetype": int(selected.sum()), "n_rest": int((~selected).sum()), "logrank_pvalue": pvalue}
+                for label, mask in [("archetype", selected), ("rest", ~selected)]:
+                    ids = set(merged.loc[mask, "patient_id"])
+                    row[f"n_tp53_assessed_{label}"] = len(ids & assessed)
+                    row[f"n_tp53_unknown_{label}"] = len(ids - assessed)
+                    row[f"n_tp53_mutant_{label}"] = len(ids & mutants) if ids & assessed else np.nan
+                rows.append(row)
+            results = pd.DataFrame(rows)
+            results["logrank_adjusted_pvalue"] = _adjust_pvalues(results.logrank_pvalue)
+            results["survival_signal"] = results.logrank_adjusted_pvalue < 0.05
+            available = results.state.eq("completed").any()
+            self._survival_results = _result("completed" if available else "unavailable",
+                                            None if available else "no valid survival comparisons", results=results,
+                                            mutation_status=mutation_status, evidence_scope="archetype_association",
+                                            adjustment="Benjamini-Hochberg", **diagnostics)
+            self._survival_data = merged.copy()
+            if km_output_dir and available:
+                self.plot_survival(km_output_dir)
         except Exception as e:
-            self._survival_results = {"skipped": True, "reason": str(e)}
+            self._survival_results = _result("failed", f"{type(e).__name__}: {e}")
+
+    def plot_survival(self, output_dir):
+        if not self._survival_results or self._survival_results["state"] != "completed":
             return
-        tp53_mutants = set()
-        if self.mut_tar_path and os.path.exists(self.mut_tar_path):
-            try:
-                tp53_df = load_maf_tp53(self.mut_tar_path)
-                tp53_mutants = set(tp53_df["patient_id"].tolist())
-            except Exception:
-                pass
-        merged = archetypes_df.merge(clinical, on="patient_id", how="inner")
-        if len(merged) < 5:
-            self._survival_results = {"skipped": True, "reason": "too few matched patients"}
-            return
-        results = []
-        for arch in sorted(merged["archetype"].unique()):
-            rest_mask = merged["archetype"] != arch
-            arch_mask = merged["archetype"] == arch
-            if arch_mask.sum() < 3 or rest_mask.sum() < 3:
+        os.makedirs(output_dir, exist_ok=True)
+        merged = self._survival_data
+        for _, row in self._survival_results["results"].iterrows():
+            if row["state"] != "completed":
                 continue
-            try:
-                from lifelines.statistics import logrank_test
-                res = logrank_test(
-                    merged.loc[arch_mask, "OS_days"], merged.loc[rest_mask, "OS_days"],
-                    merged.loc[arch_mask, "OS_event"], merged.loc[rest_mask, "OS_event"],
-                )
-                pval = float(res.p_value)
-            except Exception:
-                pval = np.nan
-            n_tp53_arch = sum(1 for p in merged.loc[arch_mask, "patient_id"] if p in tp53_mutants)
-            n_tp53_rest = sum(1 for p in merged.loc[rest_mask, "patient_id"] if p in tp53_mutants)
-            if km_output_dir:
-                os.makedirs(km_output_dir, exist_ok=True)
-                groups = [str(arch) if m else "rest" for m in arch_mask]
-                _km_plot(
-                    durations=merged["OS_days"].tolist(),
-                    events=merged["OS_event"].tolist(),
-                    groups=groups,
-                    group_labels={str(arch): f"archetype {arch}", "rest": "other"},
-                    title=f"archetype {arch} vs rest",
-                    save_path=os.path.join(km_output_dir, f"km_archetype_{arch}.png"),
-                )
-                print(f"km {arch} saved")
-            results.append({
-                "archetype": arch,
-                "n_archetype": int(arch_mask.sum()),
-                "n_rest": int(rest_mask.sum()),
-                "logrank_pvalue": pval,
-                "survival_signal": bool(not np.isnan(pval) and pval < 0.05),
-                "n_tp53_mutant_archetype": n_tp53_arch,
-                "n_tp53_mutant_rest": n_tp53_rest,
-            })
-        self._survival_results = {
-            "skipped": False,
-            "results": pd.DataFrame(results),
-            "n_matched": len(merged),
-        }
+            arch = row["archetype"]
+            groups = np.where(merged.archetype == arch, "archetype", "rest")
+            _km_plot(merged.OS_days, merged.OS_event, groups, {"archetype": f"archetype {arch}", "rest": "other"},
+                     f"archetype {arch} vs rest (adjusted p={row['logrank_adjusted_pvalue']:.3g})",
+                     os.path.join(output_dir, f"km_archetype_{arch}.png"))
 
     def _run_metabric(self, score_metadata):
-        if self.metabric_path is None or not os.path.exists(self.metabric_path):
-            self._metabric_results = {"skipped": True, "reason": "no metabric data"}
+        if self.metabric_path is None:
+            self._metabric_results = _result("skipped", "no METABRIC data", replication_rate=None)
             return
-        print("metabric replication")
         try:
-            metabric = load_metabric(self.metabric_path)
+            frame = load_metabric(self.metabric_path)
+            required = ["Patient ID", "ER status measured by IHC", "PR Status", "HER2 Status"]
+            if not set(required).issubset(frame):
+                raise InputValidationError("METABRIC requires Patient ID and ER, PR, HER2 status columns")
+            validate_ids(frame["Patient ID"], "METABRIC patient IDs")
+            receptors = frame[required[1:]].apply(lambda c: c.astype("string").str.strip().str.lower())
+            eligible = receptors.eq("negative").fillna(False).all(axis=1)
+            self._metabric_results = _result("unavailable", "clinical proxies and process-name overlap are not empirical replication",
+                                            n_tnbc=int(eligible.sum()), n_patients=len(frame), replication_rate=None,
+                                            n_receptor_unknown=int((~receptors.isin(["negative", "positive"])).any(axis=1).sum()),
+                                            empirical=False)
         except Exception as e:
-            self._metabric_results = {"skipped": True, "reason": str(e)}
-            return
-        er_col = "ER status measured by IHC"
-        her2_col = "HER2 Status"
-        tnbc_mask = pd.Series([True] * len(metabric))
-        if er_col in metabric.columns:
-            tnbc_mask &= metabric[er_col].str.lower().str.strip() == "negative"
-        if her2_col in metabric.columns:
-            tnbc_mask &= metabric[her2_col].str.lower().str.strip() == "negative"
-        metabric_tnbc = metabric[tnbc_mask].copy()
-        if len(metabric_tnbc) < 10:
-            self._metabric_results = {"skipped": True, "reason": "too few TNBC in METABRIC"}
-            return
-        METABRIC_PROXY_MAP = {
-            "TMB (nonsynonymous)":            "mutational burden",
-            "Mutation Count":                 "mutational burden",
-            "Neoplasm Histologic Grade":      "cell cycle proliferation",
-            "Nottingham prognostic index":    "tumor growth and growth factor signaling",
-            "Lymph nodes examined positive":  "tumor growth and growth factor signaling",
-        }
-        numeric_cols = metabric_tnbc.select_dtypes(include="number").columns.tolist()
-        score_cols_meta = [c for c in numeric_cols if c in METABRIC_PROXY_MAP]
-        if len(score_cols_meta) < 2:
-            score_cols_meta = [c for c in numeric_cols if c not in ["Patient ID", "Sample ID"]][:5]
-        if len(score_cols_meta) < 2:
-            self._metabric_results = {"skipped": True, "reason": "no numeric cols in METABRIC"}
-            return
-        id_col = "Patient ID" if "Patient ID" in metabric_tnbc.columns else metabric_tnbc.columns[0]
-        meta_score_df = metabric_tnbc[[id_col] + score_cols_meta].dropna().reset_index(drop=True)
-        meta_score_df = meta_score_df.rename(columns={id_col: "patient_id"})
-        meta_l1 = ConcordanceAnalyzer(meta_score_df, "patient_id")
-        meta_l1.fit(n_archetypes=3, n_bootstrap=100)
-        meta_meta = {
-            sc: {"process": METABRIC_PROXY_MAP.get(sc, sc.replace("_", " ")), "modality": "clinical"}
-            for sc in score_cols_meta
-        }
-        meta_l3 = HypothesisGenerator(meta_meta, meta_l1.archetypes())
-        meta_l3.generate()
-        meta_hyp = meta_l3.hypotheses()
-        self._metabric_results = {
-            "skipped": False,
-            "n_tnbc": len(metabric_tnbc),
-            "metabric_hypotheses": meta_hyp,
-            "replication_rate": None,
-        }
+            self._metabric_results = _result("failed", f"{type(e).__name__}: {e}", replication_rate=None, empirical=False)
 
     def compute_replication_rate(self, tcga_hypotheses):
-        if self._metabric_results is None or self._metabric_results.get("skipped"):
-            return None
-        meta_hyp = self._metabric_results.get("metabric_hypotheses")
-        if meta_hyp is None or meta_hyp.empty:
-            return None
-        tcga_top = tcga_hypotheses.head(10)["process"].tolist()
-        meta_top = meta_hyp.head(10)["process"].tolist()
-        matched = 0
-        replicated_processes = set()
-        for t in tcga_top:
-            for m in meta_top:
-                if difflib.SequenceMatcher(None, t.lower(), m.lower()).ratio() > 0.6:
-                    matched += 1
-                    replicated_processes.add(t)
-                    break
-        rate = matched / max(len(tcga_top), 1)
-        self._metabric_results["replication_rate"] = rate
-        self._metabric_results["replicated_processes"] = replicated_processes
-        return rate
+        return None
 
     def _run_benchmark(self, score_df, patient_col, score_metadata, archetypes_df):
-        if self.tcga_brca_path is None or not os.path.exists(self.tcga_brca_path):
-            self._benchmark_results = {"skipped": True, "reason": "no tcga brca data"}
+        if self.tcga_brca_path is None:
+            self._benchmark_results = _result("skipped", "no empirical benchmark supplied", empirical=False)
             return
-        print("benchmark validation")
         try:
-            tcga_brca = load_tcga_brca(self.tcga_brca_path)
+            frame = load_tcga_brca(self.tcga_brca_path)
+            if frame.empty:
+                raise InputValidationError("benchmark table is empty")
+            self._benchmark_results = _result("unavailable", "a clinical table alone cannot validate subtype recovery; no empirical benchmark adapter is available",
+                                             empirical=False, n_records=len(frame), mean_precision=None, mean_recall=None)
         except Exception as e:
-            self._benchmark_results = {"skipped": True, "reason": str(e)}
-            return
-        lehmann_results = {}
-        for subtype, keywords in LEHMANN_SIGNATURES.items():
-            n = max(20, min(40, len(tcga_brca) // 10))
-            rng = np.random.default_rng(hash(subtype) % (2 ** 32))
-            fake_patients = [f"{subtype}_{i}" for i in range(n)]
-            score_names = list(score_metadata.keys())
-            n_scores = max(2, len(score_names))
-            fake_scores = {"patient_id": fake_patients}
-            for sc in score_names[:n_scores]:
-                process = score_metadata[sc].get("process", sc)
-                match = any(kw.lower() in process.lower() for kw in keywords)
-                fake_scores[sc] = rng.uniform(0.6, 1.0, n) if match else rng.uniform(0.0, 0.4, n)
-            if len(score_names) < 2:
-                fake_scores["dummy_score"] = rng.uniform(0, 1, n)
-                score_names_here = score_names + ["dummy_score"]
-            else:
-                score_names_here = score_names[:n_scores]
-            fake_df = pd.DataFrame(fake_scores)
-            fake_l1 = ConcordanceAnalyzer(fake_df, "patient_id")
-            fake_l1.fit(n_archetypes=2, n_bootstrap=50)
-            fake_l3 = HypothesisGenerator(
-                {sc: score_metadata[sc] for sc in score_names_here if sc in score_metadata},
-                fake_l1.archetypes(),
-            )
-            fake_l3.generate()
-            fake_hyp = fake_l3.hypotheses()
-            if fake_hyp is not None and not fake_hyp.empty:
-                recovered = []
-                for _, row in fake_hyp.iterrows():
-                    process = str(row.get("process", ""))
-                    reactome = str(row.get("reactome_pathway", ""))
-                    enrichr = str(row.get("enrichr_term", ""))
-                    for kw in keywords:
-                        if any(kw.lower() in s.lower() for s in [process, reactome, enrichr]):
-                            recovered.append(kw)
-                            break
-                precision = len(recovered) / max(len(fake_hyp), 1)
-                recall = len(set(recovered)) / max(len(keywords), 1)
-            else:
-                precision = 0.0
-                recall = 0.0
-                recovered = []
-            lehmann_results[subtype] = {
-                "precision": precision,
-                "recall": recall,
-                "keywords": keywords,
-                "recovered_processes": list(set(recovered)),
-            }
-        process_bench_pass = set()
-        for subtype, vals in lehmann_results.items():
-            if vals["precision"] > 0.15 and vals["recall"] > 0.15:
-                for kw in vals["keywords"]:
-                    process_bench_pass.add(kw.lower())
-                for proc in vals.get("recovered_processes", []):
-                    process_bench_pass.add(proc.lower())
-        self._benchmark_results = {
-            "skipped": False,
-            "lehmann_results": lehmann_results,
-            "mean_precision": float(np.mean([v["precision"] for v in lehmann_results.values()])),
-            "mean_recall": float(np.mean([v["recall"] for v in lehmann_results.values()])),
-            "process_bench_pass": process_bench_pass,
-        }
+            self._benchmark_results = _result("failed", f"{type(e).__name__}: {e}", empirical=False)
 
     def _run_literature(self, hypotheses_df, score_metadata):
         if hypotheses_df is None or hypotheses_df.empty:
-            self._literature_results = {"skipped": True, "reason": "no hypotheses"}
+            self._literature_results = _result("skipped", "no hypotheses")
             return
-        print("literature scoring")
-        rows = []
-        for _, row in hypotheses_df.head(20).iterrows():
-            process = str(row.get("process", ""))
-            reactome = str(row.get("reactome_pathway", ""))
-            query = f"{process} {reactome} breast cancer"
-            count = _count_pubmed(query.strip())
-            time.sleep(0.3)
-            rows.append({
-                "archetype": row.get("archetype", ""),
-                "process": process,
-                "pubmed_query": query,
-                "pubmed_count": count,
-                "pubmed_flag": _pubmed_flag(count),
-                "literature_support": bool(count > 50),
-            })
-        self._literature_results = {
-            "skipped": False,
-            "results": pd.DataFrame(rows),
-        }
+        columns = [c for c in ["archetype", "process", "pubmed_query", "pubmed_count", "pubmed_flag", "source_status"] if c in hypotheses_df]
+        self._literature_results = _result("unavailable", "publication counts annotate prior knowledge; they do not validate hypotheses",
+                                          results=hypotheses_df[columns].copy(), empirical=False)
 
     def _assign_tiers(self, hypotheses_df):
         if hypotheses_df is None or hypotheses_df.empty:
             self._tiered_hypotheses = hypotheses_df
             return
-        surv_archs = set()
-        if self._survival_results and not self._survival_results.get("skipped"):
-            surv_df = self._survival_results.get("results", pd.DataFrame())
-            if not surv_df.empty and "survival_signal" in surv_df.columns:
-                surv_archs = set(surv_df[surv_df["survival_signal"]]["archetype"].tolist())
-        replicated_processes = set()
-        if self._metabric_results and not self._metabric_results.get("skipped"):
-            replicated_processes = self._metabric_results.get("replicated_processes", set())
-        process_bench_pass = set()
-        if self._benchmark_results and not self._benchmark_results.get("skipped"):
-            process_bench_pass = self._benchmark_results.get("process_bench_pass", set())
-        lit_processes = set()
-        if self._literature_results and not self._literature_results.get("skipped"):
-            lit_df = self._literature_results.get("results", pd.DataFrame())
-            if not lit_df.empty:
-                lit_processes = set(lit_df[lit_df["literature_support"]]["process"].tolist())
-        tiered = hypotheses_df.copy()
-        tiers = []
-        val_scores = []
-        for _, row in tiered.iterrows():
-            arch = row.get("archetype", -1)
-            process = str(row.get("process", ""))
-            process_lower = process.lower()
-            score = 0
-            if arch in surv_archs:
-                score += 1
-            if process in replicated_processes:
-                score += 1
-            if any(kw in process_lower for kw in process_bench_pass):
-                score += 1
-            if process in lit_processes:
-                score += 1
-            val_scores.append(score)
-            if score >= 3:
-                tiers.append("A")
-            elif score >= 2:
-                tiers.append("B")
-            else:
-                tiers.append("C")
-        tiered["confidence_tier"] = tiers
-        tiered["validation_score"] = val_scores
-        self._tiered_hypotheses = tiered.sort_values(
-            ["confidence_tier", "db_support"], ascending=[True, False]
-        ).reset_index(drop=True)
+        tiered = hypotheses_df.copy(deep=True)
+        tiered["confidence_tier"] = "C"
+        tiered["validation_score"] = 0
+        tiered["validation_status"] = "unavailable"
+        tiered["validation_reason"] = "no hypothesis-specific empirical validation; Tier C is exploratory only"
+        tiered["empirically_validated"] = False
+        self._tiered_hypotheses = tiered.sort_values("db_support", ascending=False, kind="stable").reset_index(drop=True)
 
     def survival_results(self):
         return self._survival_results

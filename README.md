@@ -1,248 +1,217 @@
-# bioconverge
+# BioConverge
 
-Multi-layer biological score integration and hypothesis validation tool for cancer research.
+BioConverge is a Python framework for patient-level biological score integration,
+concordance analysis, archetype discovery, hypothesis annotation, and model
+fragility analysis when trained models and their inputs are available. It supports
+validation-aware computational analysis with explicit evidence and failure states.
 
-[![PyPI version](https://badge.fury.io/py/bioconverge.svg)](https://pypi.org/project/bioconverge/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+For bioinformatics and computational biology research, including cancer informatics
+and multi-omics score analysis, BioConverge helps explore patient heterogeneity and
+patient stratification. It operates on supplied scores, not a general raw multi-omics
+processing pipeline. Hypothesis generation is exploratory metadata annotation,
+not empirical validation or biomarker discovery.
 
-## What it does
+## Installation
 
-When you have multiple biological scores per patient — from transcriptomics, genomics, imaging, or clinical data — they often disagree. One patient might have high immune activity but low genomic instability. Another might show the opposite. bioconverge asks: what biology explains these conflicts, and how confident can we be?
-
-It runs four layers:
-
-- **Layer 1** — finds which scores agree and which conflict per patient, assigns convergence strata and discordance archetypes
-- **Layer 2** — computes per-patient biological fragility using model gradient perturbation
-- **Layer 3** — generates ranked hypotheses for each archetype by querying Reactome, Enrichr, STRING, GWAS Catalog, and PubMed
-- **Layer 4** — validates each hypothesis across four independent sources and assigns Tier A / B / C confidence
-
-## Install
+Requires **Python 3.10 or newer**.
 
 ```bash
 pip install bioconverge
 ```
 
-## What data you need
+| Optional extra | Installation | Purpose |
+|---|---|---|
+| `topology` | `pip install "bioconverge[topology]"` | UMAP and HDBSCAN for model-gradient topology |
+| `report` | `pip install "bioconverge[report]"` | Interactive Plotly reports |
+| `torch` | `pip install "bioconverge[torch]"` | PyTorch model analysis |
+| `tensorflow` | `pip install "bioconverge[tensorflow]"` | TensorFlow model analysis |
+| `notebook` | `pip install "bioconverge[notebook]"` | JupyterLab and notebook/report dependencies |
+| `test` | `pip install "bioconverge[test]"` | Tests, builds, and metadata checks |
 
-A CSV file with patients as rows and scores as columns:
-
-```
-patient_id, immune_score, genomic_score, proliferation_score
-TCGA-A1-001, 0.82, 0.31, 0.74
-TCGA-A1-002, 0.45, 0.88, 0.22
-TCGA-A1-003, 0.61, 0.55, 0.60
-```
-
-bioconverge works with any domain where multiple scores exist per sample:
-
-| Domain | Example scores |
-|---|---|
-| Cancer multi-omics | immune infiltration, TMB, CNA burden, methylation, proliferation |
-| Drug response | IC50 from multiple assays on same cell lines |
-| Clinical trial | PET scan score, blood biomarker, genomic risk score |
-| Single cell | pathway activity scores across multiple pathways per cell |
+Extras can be combined: `pip install "bioconverge[topology,report]"`.
+Survival dependencies are included in the core installation.
 
 ## Quick start
 
+These illustrative values demonstrate the API; they are not research results.
+Replace them with measured scores for your study.
+
 ```python
+import pandas as pd
 import bioconverge as bc
 
-result = bc.integrate(
-    scores="my_scores.csv",
-    patient_col="patient_id",
+scores = pd.DataFrame({
+    "patient_id": ["P1", "P2", "P3", "P4", "P5", "P6"],
+    "immune_score": [0.8, 0.7, 0.2, 0.3, 0.6, 0.1],
+    "genomic_score": [0.2, 0.4, 0.9, 0.7, 0.5, 0.8],
+})
+
+result = bc.integrate(scores, n_archetypes=2, n_bootstrap=100, random_state=42)
+print(result.concordance())
+print(result.archetypes())
+print(result.statuses())
+result.report("bioconverge_report")
+```
+
+This runs Layer 1 without external requests. Reports require a new or empty
+directory. `integrate()` itself does not write report files.
+
+## Input data and validation
+
+Supply a pandas DataFrame or CSV path with one row per patient, a unique patient
+identifier, and numeric score columns. For example:
+
+| patient_id | immune_score | genomic_score |
+|---|---:|---:|
+| P1 | 0.8 | 0.2 |
+| P2 | 0.7 | 0.4 |
+| P3 | 0.2 | 0.9 |
+
+Choose scientifically meaningful scores and record their derivation. Validate
+the `scores` DataFrame above before execution:
+
+```python
+checks = bc.validate(scores, n_archetypes=2, random_state=42)
+print(checks.to_dict())
+checks.raise_for_errors()
+```
+
+`validate()` performs local preflight checks without API requests or output writes.
+Its report exposes `valid`, `errors`, `warnings`, and `details`. Invalid integration
+inputs raise `InputValidationError`.
+
+- IDs must be unique, nonmissing, and consistently typed; score names must be unique.
+- Partial missing scores are allowed. Concordance uses paired observations;
+  clustering median-imputes each score. Convergence uses observed scores and is
+  undefined with fewer than two available scores for a patient.
+- Nonnumeric or infinite scores and entirely missing rows or columns are rejected.
+  Constant columns are reported and retained; all-constant inputs are rejected.
+- Correlations with fewer than five paired observations or a constant score are
+  undefined, with reasons recorded. Undefined values are not evidence of disagreement.
+- `n_archetypes` cannot exceed the number of distinct usable patient profiles.
+- Model features must be finite. DataFrame indices must match patient IDs exactly
+  and are reordered by ID; arrays must follow score-row order. Feature columns
+  must follow the model's training order.
+
+## Four analysis layers
+
+| Layer | Current behavior | Required inputs |
+|---|---|---|
+| 1. Concordance and archetypes | Spearman correlations with bootstrap intervals, convergence strata, standardized KMeans archetypes, and bootstrap stability | Patient score matrix |
+| 2. Model fragility | Input perturbation/gradient sensitivity, trajectories, optional pathway aggregation, and optional UMAP/HDBSCAN topology | Trained `models` and aligned `feature_matrix`; matching backend dependencies |
+| 3. Hypothesis annotation | Metadata-based process annotations using Reactome, Enrichr, STRING, GWAS Catalog, and PubMed | `score_metadata`; explicit `disease_context` for literature queries |
+| 4. Validation-aware analysis | Archetype-versus-rest survival association, evidence availability, and exploratory annotation tiers | Survival `outcome` and/or relevant validation inputs |
+
+Optional analyses execute only when their required inputs and dependencies are
+available. Missing topology dependencies do not prevent core fragility analysis.
+Missing inputs are reported; invalid supplied inputs are not silently ignored.
+
+Layer 2 supports compatible scikit-learn predictors and optional neural backends.
+Scikit-learn classifiers must provide probabilities; multiclass outputs require
+an explicit `target_class` column index. Fragility is local model sensitivity,
+not patient risk or distance to a decision boundary.
+
+Layer 4 reports raw log-rank and Benjamini-Hochberg-adjusted p-values. Survival
+association does not validate every annotated process. Version 0.2.0 does not
+implement empirical METABRIC replication or Lehmann subtype recovery. Tier C
+means exploratory, unvalidated annotation; Tier A/B promotion is disabled.
+See `CHANGES.md` in the source distribution for changes affecting earlier analyses.
+
+## Custom data
+
+For a CSV with a `sample_id` identifier and an `immune_score` column, alongside
+other numeric scores:
+
+```python
+custom = bc.integrate(
+    "my_scores.csv",
+    patient_col="sample_id",
     score_metadata={
         "immune_score": {
-            "process": "T-cell exhaustion",
+            "process": "immune activation",
             "modality": "transcriptomic",
-            "genes": ["CD8A", "CD8B", "GZMA", "PRF1"]
-        },
-        "genomic_score": {
-            "process": "DNA repair instability",
-            "modality": "genomic",
-            "genes": ["BRCA1", "BRCA2", "ATM", "TP53"]
-        },
-        "proliferation_score": {
-            "process": "cell cycle proliferation",
-            "modality": "transcriptomic",
-            "genes": ["MKI67", "PCNA", "TOP2A", "CDK1"]
+            "genes": ["CD8A", "CD8B", "GZMA", "PRF1"],
         }
-    }
+    },
+    disease_context="glioblastoma",
+    random_state=42,
+    replay_only=True,
 )
-
-result.report("output/")
+print(custom.hypotheses())
 ```
 
-## With survival data
+Use metadata and a disease context appropriate to your study. This example runs
+offline: uncached external annotations are unavailable. Set `replay_only=False`
+to query current external resources.
 
-```python
-result = bc.integrate(
-    scores="my_scores.csv",
-    patient_col="patient_id",
-    score_metadata={...},
-    outcome="survival.csv",
-    time_col="OS_days",
-    event_col="OS_event"
-)
+For survival association, pass `outcome="survival.csv"`, `time_col`, `event_col`,
+and `time_unit="days"`, `"months"`, or `"years"`. Supply `event_mapping` for
+nonstandard labels. Common column names can also be detected. Missing outcomes
+are excluded with counts; identical endpoint records are deduplicated. Conflicting
+records, invalid events, and negative or infinite durations are rejected.
+Missing mutation assessment remains unknown.
 
-result.survival_analysis()
-```
+## Results and analysis states
 
-bioconverge auto-detects column names from any CSV. If your survival file uses different column names just specify them:
+`integrate()` returns a `BioConvergeResult`:
 
-```python
-result = bc.integrate(
-    scores="my_scores.csv",
-    patient_col="patient_id",
-    score_metadata={...},
-    outcome="survival.csv",
-    time_col="survival_months",
-    event_col="vital_status"
-)
-```
-
-## What you get back
-
-```python
-result.concordance()       # pairwise score agreement with confidence intervals
-result.convergence()       # per-patient convergence index and strata
-result.discordance()       # patients with conflicting scores
-result.archetypes()        # patient archetype assignments
-result.hypotheses()        # ranked hypotheses with Tier A/B/C labels
-result.survival_analysis() # KM curves per archetype (if survival data provided)
-result.compare_layers()    # patients flagged by both Layer 1 and Layer 2
-result.report("output/")   # full HTML report and CSV outputs
-```
-
-## Confidence tiers
-
-Each hypothesis is validated across four independent sources:
-
-1. Survival consistency — does this archetype show a survival difference?
-2. Replication — does the same hypothesis appear in an independent cohort?
-3. Known-biology benchmark — does it match established pathway signatures?
-4. Literature — how many PubMed records support this process?
-
-| Tier | Validation sources passed | Interpretation |
-|---|---|---|
-| A | 3 or 4 | finding — state as result |
-| B | 2 | supported hypothesis — state as supported |
-| C | 0 or 1 | exploratory — requires experimental follow-up |
-
-## Output files
-
-Running `result.report("output/")` produces:
-
-| File | Contents |
+| API | Contents |
 |---|---|
-| `summary.html` | interactive concordance matrix and patient strata |
-| `per_patient_scores.csv` | convergence index, archetype, fragility per patient |
-| `hypotheses_ranked.csv` | full hypothesis table with Tier A/B/C labels and database links |
-| `reproducibility_log.txt` | all API queries with timestamps for reproducibility |
-| `kaplan_meier/` | survival plots per archetype as PNG |
-| `fragility_topology.png` | UMAP of patient fragility clusters |
+| `concordance()` | Score-pair correlations, intervals, counts, and reasons |
+| `convergence()`, `discordance()` | Convergence indices, strata, and low-convergence patients |
+| `archetypes()`, `stability()` | Cluster assignments and bootstrap diagnostics |
+| `fragility()`, `fragility_pathways()` | Available model-sensitivity results |
+| `hypotheses()` | Available exploratory metadata annotations |
+| `survival_analysis()` | Survival results and availability details |
+| `compare_layers()` | Patients flagged by both low convergence and high fragility |
+| `statuses()`, `metadata()` | Layer/component states, reasons, inputs, parameters, and environment |
+| `report(path)` | HTML, CSV, JSON, and available figures |
 
-## TNBC demonstration
+Inspect component states even when their parent layer completed:
 
-The full demonstration on 116 TCGA-BRCA triple-negative breast cancer patients is in `notebooks/01_TNBC_demo.ipynb`.
-
-Scores used:
-
-| Score | Source | Genes |
-|---|---|---|
-| proliferation_score | MKI67 RNA-seq expression | MKI67 |
-| immune_score | cytotoxic T-cell signature | CD8A, CD8B, GZMA, PRF1 |
-| emt_score | EMT hallmark gene set mean | 200 genes |
-| mutation_score | TMB from MAF files | — |
-| genomic_score | Fraction Genome Altered | — |
-| size_score | Longest Dimension (clinical) | — |
-
-Results: 6 Tier A findings, 9 Tier B supported hypotheses, 3 Tier C exploratory.
-
-Validated on GBM (488 patients, ARI 0.851): 8 Tier A findings with significant survival separation (archetype 0 p=0.034, archetype 2 p=0.008).
-
-Datasets required:
-
-| Dataset | Source |
+| State | Meaning |
 |---|---|
-| TCGA-BRCA clinical | https://portal.gdc.cancer.gov/projects/TCGA-BRCA |
-| TCGA-BRCA mutations | http://gdac.broadinstitute.org |
-| TCGA-BRCA RNA-seq | http://gdac.broadinstitute.org |
-| METABRIC clinical | https://www.cbioportal.org/study/summary?id=brca_metabric |
-| Lehmann subtypes | https://www.cbioportal.org/study/summary?id=brca_tcga |
-| MSigDB Hallmark | https://www.gsea-msigdb.org/gsea/msigdb |
+| `completed` | Operation ran; this does not establish biological validity |
+| `skipped` | Operation was not requested or required inputs were not supplied |
+| `failed` | Execution or supplied data caused an error |
+| `unavailable` | No usable result or supported validation method is available |
 
-## Benchmarking
+Execution failures normally raise `AnalysisError` with layer statuses. Use
+`on_error="record"` to retain partial results and failure reasons. Component
+failures can also appear within returned results; inspect them explicitly.
 
-bioconverge was compared against five clustering methods on the TNBC cohort:
+Reports include `summary.html`, `concordance.csv`, `per_patient_scores.csv`,
+available `hypotheses_ranked.csv`, and optional figures. JSON files preserve run
+metadata, statuses, validation results, API responses, query logs, and an artifact
+SHA-256 manifest. Unavailable analyses do not produce invented outputs.
 
-| Method | ARI | Silhouette |
-|---|---|---|
-| bioconverge (Layer 1) | 0.398 | 0.197 |
-| PCA + KMeans | 0.401 | 0.203 |
-| NMF + KMeans | 0.491 | 0.140 |
-| Hierarchical Ward | 0.210 | 0.286 |
-| Gaussian Mixture | 0.223 | 0.159 |
-| MOFA+ | 0.789 | 0.128 |
+## External resources and reproducibility
 
-bioconverge is the only method that combines clustering with concordance analysis, database-driven hypothesis generation, and tiered validation.
+Online annotation sends process terms and supplied gene lists to external
+resources. STRING evidence requires returned protein interactions; Enrichr uses
+adjusted-significant enrichment terms. Requests have timeouts and bounded retries.
+Failed, unavailable, and successful empty responses are distinguished. An
+unavailable external service is **not negative biological evidence**.
 
-## Parameters
+Pass `api_cache={}` to retain responses, or reload a report's `api_responses.json`
+and supply it with `replay_only=True` for offline evidence replay. Live databases
+can change independently of the random seed.
 
-| Parameter | Required | Description |
-|---|---|---|
-| `scores` | yes | path to CSV with patient scores |
-| `patient_col` | yes | name of patient ID column |
-| `score_metadata` | yes | dict with process, modality, genes per score |
-| `models` | no | trained sklearn/PyTorch/TensorFlow models for Layer 2 |
-| `feature_matrix` | no | feature matrix X for Layer 2 fragility |
-| `pathway_constraints` | no | "hallmark" to use MSigDB Hallmark gene sets |
-| `outcome` | no | path to survival CSV |
-| `time_col` | no | name of time column in survival CSV |
-| `event_col` | no | name of event column in survival CSV |
+`random_state` must be an integer from 0 through `2**32 - 1`. It controls package
+clustering, bootstrap sampling, bootstrap KMeans seeds, and optional topology.
+Stability uses at most 200 bootstrap fits and reports actual counts; concordance
+uses the requested `n_bootstrap`. Reproducible research also requires unchanged
+data, preprocessing, trained models, dependencies, and numerical runtime settings.
+The seed does not control external model training or guarantee agreement across
+hardware and library versions. Record your environment with `pip freeze`.
 
-If a parameter is not provided, that layer is skipped gracefully and noted in the report.
+## Citation, license, and support
 
-## Requirements
+When using BioConverge, cite the software as **Koushik C. BioConverge, version
+0.2.0**, with the [repository URL](https://github.com/chykoushik/bioconverge).
+Record the version actually used and cite the underlying data resources separately.
+No journal citation or DOI is specified for this release.
 
-```
-numpy, pandas, scipy, scikit-learn, matplotlib, seaborn,
-lifelines, umap-learn, hdbscan, requests, plotly, torch,
-tensorflow, jupyter
-```
-
-## Version history
-
-### 0.1.4
-- Auto survival column detection supporting any CSV format
-- Users can now pass any survival file with any column names via time_col and event_col
-- Fixed ValidationEngine to pass time_col and event_col through all layers
-
-### 0.1.3
-- Installed as editable package for local development
-- Minor internal fixes
-
-### 0.1.2
-- Fixed convergence index clipping bug (values now bounded to [-1, 1])
-- Added benchmarking against MOFA+, PCA, NMF, Hierarchical, GMM
-- Added GBM validation cohort (488 patients, ARI 0.851)
-- Added sensitivity analysis for all key parameters
-
-### 0.1.1
-- Added long description for PyPI
-
-### 0.1.0
-- Initial release
-
-## License
-
-MIT
-
-## Citation
-
-If you use bioconverge in your research, please cite:
-
-```
-Koushik, C. (2026). bioconverge: Multi-layer biological score integration
-and hypothesis validation for cancer research.
-https://github.com/chykoushik/bioconverge
-```
+BioConverge is distributed under the **MIT License**; see the bundled `LICENSE`.
+Report reproducible problems through the
+[issue tracker](https://github.com/chykoushik/bioconverge/issues).
