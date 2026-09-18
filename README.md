@@ -1,5 +1,9 @@
 # BioConverge
 
+[![PyPI version](https://img.shields.io/pypi/v/bioconverge.svg)](https://pypi.org/project/bioconverge/)
+[![Python versions](https://img.shields.io/pypi/pyversions/bioconverge.svg)](https://pypi.org/project/bioconverge/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 BioConverge is a Python framework for patient-level biological score integration,
 concordance analysis, archetype discovery, hypothesis annotation, and model
 fragility analysis when trained models and their inputs are available. It supports
