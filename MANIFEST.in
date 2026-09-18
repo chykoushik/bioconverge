@@ -4,3 +4,4 @@ include constraints-py310-windows.txt
 include bioconverge/*.py
 include tests/*.py
 include notebooks/01_TNBC_demo.ipynb
+include docs/*.md

@@ -17,3 +17,15 @@ dist/
 
 manuscript_v020_results/
 manuscript_v020_results.zip
+venv/
+.env
+.env.*
+.idea/
+.vscode/
+.history/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.tmp
+*.log
